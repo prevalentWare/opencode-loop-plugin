@@ -1,0 +1,76 @@
+{
+  "name": "@prevalentware/opencode-loop-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode loop plugin that adds Claude Code-style /loop recurring prompts: a persistent scheduler that re-injects an instruction into a session on an interval while it is idle.",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "opencode loop plugin",
+    "opencode recurring tasks",
+    "opencode scheduler",
+    "loop",
+    "recurring",
+    "slash-command",
+    "coding-agent",
+    "ai-agent",
+    "developer-tools",
+    "agent",
+    "tui"
+  ],
+  "homepage": "https://github.com/prevalentWare/opencode-loop-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/prevalentWare/opencode-loop-plugin/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prevalentWare/opencode-loop-plugin.git"
+  },
+  "license": "MIT",
+  "author": "Prevalentware",
+  "type": "module",
+  "exports": {
+    "./server": {
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "import": "./src/tui.tsx"
+    }
+  },
+  "files": [
+    "dist",
+    "src/tui.tsx",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external effect --external zod",
+    "ci:version": "bun scripts/resolve-ci-version.ts",
+    "lint": "eslint .",
+    "pack:dry-run": "npm pack --dry-run",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run test && bun run build"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.1",
+    "effect": "^3.21.2",
+    "zod": "4.1.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@opentui/core": "^0.4.0",
+    "@opentui/solid": "^0.4.0",
+    "@types/bun": "^1.3.13",
+    "eslint": "^10.3.0",
+    "solid-js": "1.9.12",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.2"
+  },
+  "engines": {
+    "opencode": ">=1.17.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
