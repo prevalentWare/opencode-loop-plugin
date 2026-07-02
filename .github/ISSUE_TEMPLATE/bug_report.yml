@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a problem with the OpenCode loop plugin
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as you can — reproduction steps and environment info make fixes much faster.
+
+        If you believe this is a security issue, please do NOT file a public issue. Follow [SECURITY.md](https://github.com/prevalentWare/opencode-loop-plugin/blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+      placeholder: The loop stopped firing after...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the problem.
+      placeholder: |
+        1. Install the plugin with `opencode plugin @prevalentware/opencode-loop-plugin`
+        2. Create a loop with `/loop 30s ...`
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      placeholder: e.g. 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: opencode-version
+    attributes:
+      label: OpenCode version
+      placeholder: e.g. 1.17.13
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. macOS 15, Ubuntu 24.04
+  - type: input
+    id: model
+    attributes:
+      label: Model/provider in use
+      placeholder: e.g. anthropic/claude-sonnet-5
+  - type: textarea
+    id: config
+    attributes:
+      label: Plugin options
+      description: The plugin options from your `opencode.json`, if customized.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant loop state or logs
+      description: Output of `/loop list`, the loop entries from your `loops.json` state file, or relevant OpenCode logs.
+      render: text
