@@ -1,6 +1,8 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js"
+import type { Plugin as TuiPluginV2 } from "@opencode-ai/plugin-v2/tui"
+import type { SessionMessageInfo } from "@opencode-ai/client"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 
 type LoopSnapshot = {
   id: string
@@ -329,9 +331,167 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-const plugin: TuiPluginModule = {
+export function loopsFromV2Messages(messages: readonly SessionMessageInfo[]): LoopSnapshot[] | undefined {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (!message || message.type !== "assistant") continue
+    for (let partIndex = message.content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = message.content[partIndex]
+      if (!part || part.type !== "tool" || !LOOP_TOOLS.includes(part.name)) continue
+      if (part.state.status !== "completed") continue
+      for (const content of part.state.content) {
+        if (content.type !== "text") continue
+        try {
+          const parsed: unknown = JSON.parse(content.text)
+          if (isRecord(parsed) && isLoopList(parsed.loops)) return parsed.loops
+        } catch {
+          // Malformed output from a newer tool call should not hide an older valid snapshot.
+        }
+      }
+    }
+  }
+  return undefined
+}
+
+function currentSessionIDV2(api: TuiPluginV2.Context) {
+  const route = api.ui.router.current()
+  return route.type === "session" ? route.sessionID : undefined
+}
+
+function toastV2(api: TuiPluginV2.Context, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+  api.ui.toast.show({ title: "Loop", message, variant, duration: 2500 })
+}
+
+function promptForAction(action: string, loopID?: string) {
+  if (action === "refresh") return "Call list_loops for this session and report each loop briefly."
+  if (action === "clear") return "Call clear_loops for this session and report how many loops were removed."
+  if (!loopID) return undefined
+  if (action === "run") return `Call run_loop with loop_id "${loopID}" and report the result briefly.`
+  if (action === "pause") return `Call pause_loop with loop_id "${loopID}" and report the result briefly.`
+  if (action === "resume") return `Call resume_loop with loop_id "${loopID}" and report the result briefly.`
+  if (action === "stop") return `Call stop_loop with loop_id "${loopID}" and report the result briefly.`
+  return undefined
+}
+
+async function showSummaryV2(api: TuiPluginV2.Context, sessionID: string, loops: LoopSnapshot[]) {
+  const now = Date.now()
+  const open = loops.filter((loop) => loop.status === "active" || loop.status === "paused")
+  const options = [
+    { title: "Refresh", value: "refresh", description: "Ask the agent to list the current loops" },
+    ...open.flatMap((loop) => [
+      ...(loop.status === "active"
+        ? [
+            { title: `Run ${loop.id} now`, value: `run.${loop.id}`, description: loopLine(loop, now) },
+            { title: `Pause ${loop.id}`, value: `pause.${loop.id}`, description: loopLine(loop, now) },
+          ]
+        : [{ title: `Resume ${loop.id}`, value: `resume.${loop.id}`, description: loopLine(loop, now) }]),
+      { title: `Stop ${loop.id}`, value: `stop.${loop.id}`, description: loopLine(loop, now) },
+    ]),
+    ...(loops.some((loop) => loop.status === "stopped" || loop.status === "completed")
+      ? [{ title: "Clear closed loops", value: "clear", description: "Delete stopped and completed loops" }]
+      : []),
+  ]
+
+  api.ui.dialog.set({ size: "large" })
+  const selected = await api.ui.dialog.select({
+    title: "Loops",
+    placeholder: open.length === 0 ? "No open loops in this session." : open.map((loop) => loopLine(loop, now)).join("\n"),
+    options,
+  })
+  if (!selected) return
+  const separator = selected.indexOf(".")
+  const action = separator === -1 ? selected : selected.slice(0, separator)
+  const loopID = separator === -1 ? undefined : selected.slice(separator + 1)
+  const prompt = promptForAction(action, loopID)
+  if (!prompt) return
+  try {
+    await api.client.session.prompt({ sessionID, text: prompt })
+  } catch (error) {
+    toastV2(api, error instanceof Error ? error.message : String(error), "error")
+  }
+}
+
+function LoopSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
+  const [cache, setCache] = api.storage.memory<{ loops: LoopSnapshot[] }>(`loop-mode.v2.${sessionID}`, {
+    initial: { loops: [] },
+  })
+  const loops = createMemo(() => {
+    const found = loopsFromV2Messages(api.data.session.message.list(sessionID))
+    return found ?? cache.loops
+  })
+  createEffect(() => {
+    const found = loopsFromV2Messages(api.data.session.message.list(sessionID))
+    if (!found) return
+    untrack(() =>
+      setCache((draft) => {
+        draft.loops = found
+      }),
+    )
+  })
+  const open = createMemo(() => loops().filter((loop) => loop.status === "active" || loop.status === "paused"))
+  const [nowMs, setNowMs] = createSignal(Date.now())
+  createEffect(() => {
+    if (!open().some((loop) => loop.status === "active")) return
+    const timer = setInterval(() => setNowMs(Date.now()), 1000)
+    onCleanup(() => clearInterval(timer))
+  })
+
+  return (
+    <Show when={open().length > 0}>
+      <box>
+        <text fg={api.theme.text}>
+          <b>Loops</b>
+        </text>
+        <For each={open()}>
+          {(loop) => (
+            <text fg={api.theme.textMuted}>
+              {loop.status === "paused" ? "⏸ " : ""}
+              {loopLine(loop, nowMs())}
+            </text>
+          )}
+        </For>
+      </box>
+    </Show>
+  )
+}
+
+function LoopKeymapLayerV2(api: TuiPluginV2.Context) {
+  api.keymap.layer(() => ({
+    commands: [
+      {
+        id: "loop.show",
+        title: "Loops",
+        description: "View, run, pause, resume, or stop the recurring loops in this session",
+        group: "Loop",
+        palette: true,
+        run: () => {
+          const sessionID = currentSessionIDV2(api)
+          if (!sessionID) {
+            toastV2(api, "Open a session before viewing loops.", "warning")
+            return
+          }
+          const loops = loopsFromV2Messages(api.data.session.message.list(sessionID)) ?? []
+          void showSummaryV2(api, sessionID, loops)
+        },
+      },
+    ],
+  }))
+  return null
+}
+
+export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
+  const offSidebar = context.ui.slot("sidebar.content", (props) => LoopSidebarV2(context, props.sessionID))
+  const offApp = context.ui.slot("app", () => LoopKeymapLayerV2(context))
+  return () => {
+    offSidebar()
+    offApp()
+  }
+}
+
+const plugin: TuiPluginModule & TuiPluginV2.Definition = {
   id: "local.loop-mode.tui",
   tui,
+  setup: setupTuiV2,
 }
 
 export default plugin

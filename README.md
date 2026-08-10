@@ -22,7 +22,18 @@ The OpenCode Loop Plugin adds:
 
 ## Install
 
-Install locally for the current OpenCode project:
+Choose the instructions that match the CLI you run:
+
+| OpenCode version | How to identify it | Instructions |
+| --- | --- | --- |
+| OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
+| OpenCode 2 preview | You run `opencode2` | [OpenCode 2](#opencode-2-preview) |
+
+Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `~/.config/opencode/cli.json`.
+
+### OpenCode 1 Stable
+
+Install for the current OpenCode project:
 
 ```bash
 opencode plugin @prevalentware/opencode-loop-plugin
@@ -34,11 +45,7 @@ Install globally:
 opencode plugin -g @prevalentware/opencode-loop-plugin
 ```
 
-OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets.
-
-## Manual Config
-
-If you configure it manually, add the package to both config files.
+OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets. For manual installation, add the package to both V1 config files.
 
 `opencode.json`:
 
@@ -55,6 +62,30 @@ If you configure it manually, add the package to both config files.
   "plugin": ["@prevalentware/opencode-loop-plugin"]
 }
 ```
+
+### OpenCode 2 Preview
+
+This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compatible with OpenCode 1. Add the package to both V2 plugin lists.
+
+`opencode.json`:
+
+```json
+{
+  "plugins": ["@prevalentware/opencode-loop-plugin"]
+}
+```
+
+`~/.config/opencode/cli.json`:
+
+```json
+{
+  "plugins": ["@prevalentware/opencode-loop-plugin"]
+}
+```
+
+OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and palette integration are loaded from the global `~/.config/opencode/cli.json`.
+
+The OpenCode 2 plugin API is still in preview. This release targets the exact preview above; later previews may require a plugin update. V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The dedicated V1 compaction-context hook has no V2 equivalent in this preview. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
 
 ## Usage
 
@@ -98,7 +129,7 @@ A dynamic loop mirrors Claude Code's self-paced `/loop`: at the end of each iter
 
 ## Options
 
-Server options can be configured in `opencode.json`:
+In OpenCode 1, server options use the package-and-options tuple in `opencode.json`:
 
 ```json
 {
@@ -117,6 +148,29 @@ Server options can be configured in `opencode.json`:
         "command_name": "loop"
       }
     ]
+  ]
+}
+```
+
+In OpenCode 2, use the plugin object form:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@prevalentware/opencode-loop-plugin",
+      "options": {
+        "min_interval_seconds": 30,
+        "max_loops_per_session": 5,
+        "busy_backoff_seconds": 60,
+        "failure_backoff_seconds": 60,
+        "max_loop_age_days": 7,
+        "dynamic_max_delay_seconds": 86400,
+        "restricted_agents": ["plan"],
+        "register_command": true,
+        "command_name": "loop"
+      }
+    }
   ]
 }
 ```
@@ -181,7 +235,7 @@ The repository must be public for npm provenance to be generated automatically.
 
 ## Notes
 
-OpenCode plugin modules are target-specific. This package exports separate modules for server hooks/tools and TUI UI:
+OpenCode plugin modules are target-specific. This package exports separate modules for server hooks/tools and TUI UI. Each default export includes the legacy V1 entrypoint (`server` or `tui`) and the native V2 `setup` entrypoint:
 
 ```json
 {
