@@ -2,6 +2,7 @@
 import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Plugin as TuiPluginV2 } from "@opencode-ai/plugin-v2/tui"
 import type { SessionMessageInfo } from "@opencode-ai/client"
+import { createElement, insert, setProp } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 
 type LoopSnapshot = {
@@ -38,9 +39,26 @@ type SessionMessage = {
   id: string
 }
 
+type ElementChild = string | number | boolean | null | undefined | object | (() => ElementChild)
+
 const LOOP_TOOLS = ["create_loop", "list_loops", "stop_loop", "pause_loop", "resume_loop", "run_loop", "schedule_next_run", "clear_loops"]
 
 const loopCache = new Map<string, LoopSnapshot[]>()
+
+function element(tag: string, props: Record<string, unknown>, children: ElementChild[] = []) {
+  const node = createElement(tag)
+  for (const [key, value] of Object.entries(props)) if (value !== undefined) setProp(node, key, value)
+  for (const child of children) if (child !== null && child !== undefined && child !== false) insert(node, child)
+  return node
+}
+
+function text(props: Record<string, unknown>, children: ElementChild[]) {
+  return element("text", props, children)
+}
+
+function box(props: Record<string, unknown>, children: ElementChild[] = []) {
+  return element("box", props, children)
+}
 
 function loopSnapshotKey(sessionID: string) {
   return `loop-mode.snapshot.${sessionID}`
@@ -436,23 +454,18 @@ function LoopSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
     onCleanup(() => clearInterval(timer))
   })
 
-  return (
-    <Show when={open().length > 0}>
-      <box>
-        <text fg={api.theme.text}>
-          <b>Loops</b>
-        </text>
-        <For each={open()}>
-          {(loop) => (
-            <text fg={api.theme.textMuted}>
-              {loop.status === "paused" ? "⏸ " : ""}
-              {loopLine(loop, nowMs())}
-            </text>
-          )}
-        </For>
-      </box>
-    </Show>
-  )
+  return box({}, [() => {
+    const loops = open()
+    if (loops.length === 0) return null
+    return box({}, [
+      text({ fg: api.theme.text }, ["Loops"]),
+      ...loops.map((loop) =>
+        text({ fg: api.theme.textMuted }, [
+          `${loop.status === "paused" ? "paused " : ""}${loopLine(loop, nowMs())}`,
+        ]),
+      ),
+    ])
+  }])
 }
 
 function LoopKeymapLayerV2(api: TuiPluginV2.Context) {
