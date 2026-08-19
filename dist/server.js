@@ -260,6 +260,20 @@ async function getLoop(loopID) {
   const loop = state.loops[loopID];
   return loop ? snapshot(loop) : null;
 }
+async function claimDueRun(loopID, leaseMs) {
+  const lease = positiveIntegerOrNull(Math.round(leaseMs));
+  if (lease == null)
+    throw new Error("run claim lease must be a positive number of milliseconds");
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID);
+    const timestamp = now();
+    if (loop.status !== "active" || loop.nextRunAt == null || loop.nextRunAt > timestamp)
+      return null;
+    loop.nextRunAt = timestamp + lease;
+    loop.updatedAt = timestamp;
+    return snapshot(loop);
+  });
+}
 async function listLoops(sessionID) {
   const state = await readState();
   return Object.values(state.loops).filter((loop) => sessionID == null || loop.sessionID === sessionID).sort((a, b) => a.createdAt - b.createdAt).map(snapshot);
@@ -501,6 +515,7 @@ var DEFAULT_BUSY_BACKOFF_SECONDS = 60;
 var DEFAULT_FAILURE_BACKOFF_SECONDS = 60;
 var DEFAULT_MAX_LOOP_AGE_DAYS = 7;
 var DEFAULT_DYNAMIC_MAX_DELAY_SECONDS = 24 * 60 * 60;
+var RUN_CLAIM_LEASE_MS = 30000;
 var DEFAULT_RESTRICTED_AGENTS = ["plan"];
 var LOOP_SYSTEM_MARKER = "OpenCode loop mode";
 function commandNameFromOptions(options) {
@@ -612,13 +627,21 @@ var server = async ({ client }, options) => {
     }
   }
   async function runDueLocked(loopID) {
-    const loop = await getLoop(loopID);
+    let loop = await getLoop(loopID);
     if (!loop || loop.status !== "active" || loop.nextRunAt == null)
       return;
     if (loop.nextRunAt > Date.now()) {
       scheduleTimer(loop);
       return;
     }
+    const claimed = await claimDueRun(loopID, RUN_CLAIM_LEASE_MS);
+    if (!claimed) {
+      loop = await getLoop(loopID);
+      if (loop)
+        scheduleTimer(loop);
+      return;
+    }
+    loop = claimed;
     if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
@@ -987,13 +1010,21 @@ async function setupV2(context) {
     }
   }
   async function runDueLocked(loopID) {
-    const loop = await getLoop(loopID);
+    let loop = await getLoop(loopID);
     if (!loop || loop.status !== "active" || loop.nextRunAt == null)
       return;
     if (loop.nextRunAt > Date.now()) {
       scheduleTimer(loop);
       return;
     }
+    const claimed = await claimDueRun(loopID, RUN_CLAIM_LEASE_MS);
+    if (!claimed) {
+      loop = await getLoop(loopID);
+      if (loop)
+        scheduleTimer(loop);
+      return;
+    }
+    loop = claimed;
     if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;

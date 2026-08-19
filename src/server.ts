@@ -8,6 +8,7 @@ import {
   DEFAULT_MIN_INTERVAL_SECONDS,
   MAX_PROMPT_CHARS,
   activeLoops,
+  claimDueRun,
   clearClosedLoops,
   createLoop,
   formatLoops,
@@ -44,6 +45,7 @@ const DEFAULT_BUSY_BACKOFF_SECONDS = 60
 const DEFAULT_FAILURE_BACKOFF_SECONDS = 60
 const DEFAULT_MAX_LOOP_AGE_DAYS = 7
 const DEFAULT_DYNAMIC_MAX_DELAY_SECONDS = 24 * 60 * 60
+const RUN_CLAIM_LEASE_MS = 30_000
 const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const LOOP_SYSTEM_MARKER = "OpenCode loop mode"
 
@@ -170,12 +172,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
   }
 
   async function runDueLocked(loopID: string) {
-    const loop = await getLoop(loopID)
+    let loop = await getLoop(loopID)
     if (!loop || loop.status !== "active" || loop.nextRunAt == null) return
     if (loop.nextRunAt > Date.now()) {
       scheduleTimer(loop)
       return
     }
+    const claimed = await claimDueRun(loopID, RUN_CLAIM_LEASE_MS)
+    if (!claimed) {
+      loop = await getLoop(loopID)
+      if (loop) scheduleTimer(loop)
+      return
+    }
+    loop = claimed
     if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86_400_000)} days`)
       return
@@ -579,12 +588,19 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   async function runDueLocked(loopID: string) {
-    const loop = await getLoop(loopID)
+    let loop = await getLoop(loopID)
     if (!loop || loop.status !== "active" || loop.nextRunAt == null) return
     if (loop.nextRunAt > Date.now()) {
       scheduleTimer(loop)
       return
     }
+    const claimed = await claimDueRun(loopID, RUN_CLAIM_LEASE_MS)
+    if (!claimed) {
+      loop = await getLoop(loopID)
+      if (loop) scheduleTimer(loop)
+      return
+    }
+    loop = claimed
     if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86_400_000)} days`)
       return

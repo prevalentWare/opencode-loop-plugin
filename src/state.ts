@@ -336,6 +336,19 @@ export async function getLoop(loopID: string) {
   return loop ? snapshot(loop) : null
 }
 
+export async function claimDueRun(loopID: string, leaseMs: number) {
+  const lease = positiveIntegerOrNull(Math.round(leaseMs))
+  if (lease == null) throw new Error("run claim lease must be a positive number of milliseconds")
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    const timestamp = now()
+    if (loop.status !== "active" || loop.nextRunAt == null || loop.nextRunAt > timestamp) return null
+    loop.nextRunAt = timestamp + lease
+    loop.updatedAt = timestamp
+    return snapshot(loop)
+  })
+}
+
 export async function listLoops(sessionID?: string) {
   const state = await readState()
   return Object.values(state.loops)

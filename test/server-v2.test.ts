@@ -405,6 +405,28 @@ test("V2 setup rehydrates persisted active loops", async () => {
   await cleanup2()
 })
 
+test("V2 concurrent plugin contexts claim a persisted run only once", async () => {
+  const creator = makeMockContext()
+  const cleanupCreator = await plugin.setup(creator as never)
+  await loopTool(creator, "create_loop").execute({ instruction: "say tick", interval: "1s" }, toolContext())
+  creator.stream.end()
+  await cleanupCreator()
+
+  const first = makeMockContext()
+  const second = makeMockContext()
+  const cleanupFirst = await plugin.setup(first as never)
+  const cleanupSecond = await plugin.setup(second as never)
+
+  await waitFor(() => first.promptCalls.length + second.promptCalls.length >= 1)
+  await sleep(100)
+  expect(first.promptCalls.length + second.promptCalls.length).toBe(1)
+
+  first.stream.end()
+  second.stream.end()
+  await cleanupFirst()
+  await cleanupSecond()
+})
+
 test("V2 cleanup disposes registrations, clears timers, and stops the event consumer", async () => {
   const mock = makeMockContext()
   const cleanup = await plugin.setup(mock as never)
