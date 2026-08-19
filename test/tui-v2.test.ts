@@ -68,7 +68,12 @@ function mockContext() {
     client: { session: { prompt: async (input: { sessionID: string; text: string }) => void prompts.push(input) } },
     data: { session: { message: { list: () => messages() } } },
     attention: undefined,
-    theme: { text: "#ffffff", textMuted: "#888888", primary: "#00ff00" },
+    theme: {
+      text: {
+        default: "#ffffff",
+        subdued: "#888888",
+      },
+    },
     markdown: undefined,
     keymap: { layer: (input: () => Layer) => void layers.push(input) },
     storage: {

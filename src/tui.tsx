@@ -458,9 +458,9 @@ function LoopSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
     const loops = open()
     if (loops.length === 0) return null
     return box({}, [
-      text({ fg: api.theme.text }, ["Loops"]),
+      text({ fg: api.theme.text.default }, ["Loops"]),
       ...loops.map((loop) =>
-        text({ fg: api.theme.textMuted }, [
+        text({ fg: api.theme.text.subdued }, [
           `${loop.status === "paused" ? "paused " : ""}${loopLine(loop, nowMs())}`,
         ]),
       ),
