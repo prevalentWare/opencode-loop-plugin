@@ -974,6 +974,22 @@ async function setupV2(context) {
   const dynamicPending = new Map;
   const registrations = [];
   const isRestrictedAgent = (agent) => typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase());
+  async function isSessionBusy(sessionID) {
+    const session = context.session;
+    if (typeof session.active !== "function")
+      return busySessions.has(sessionID);
+    try {
+      const active = await session.active();
+      const busy = Object.hasOwn(active, sessionID);
+      if (busy)
+        busySessions.add(sessionID);
+      else
+        busySessions.delete(sessionID);
+      return busy;
+    } catch {
+      return busySessions.has(sessionID);
+    }
+  }
   function cancelTimer(loopID) {
     const timer = timers.get(loopID);
     if (timer)
@@ -1029,7 +1045,7 @@ async function setupV2(context) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
-    if (busySessions.has(loop.sessionID)) {
+    if (await isSessionBusy(loop.sessionID)) {
       const deferred = await recordRunDeferred(loopID, "skipped_busy", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
       scheduleTimer(deferred);
       return;

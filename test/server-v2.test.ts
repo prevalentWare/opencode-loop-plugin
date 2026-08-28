@@ -65,6 +65,7 @@ function controlledStream() {
 
 type MockContext = {
   options: Record<string, unknown>
+  activeSessions: Set<string>
   promptCalls: Array<{ sessionID: string; text: string; agents?: Array<{ name: string }> }>
   tools: Array<ToolDraft["add"] extends (tool: infer T) => void ? T : never>
   commandDraft: MockCommandDraft
@@ -79,6 +80,7 @@ type MockContext = {
   }
   session: {
     hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
+    active: () => Promise<Record<string, { type: "running" }>>
     prompt: (input: { sessionID: string; text: string; agents?: Array<{ name: string }> }) => Promise<unknown>
   }
   event: {
@@ -89,6 +91,7 @@ type MockContext = {
 function makeMockContext(options: Record<string, unknown> = {}): MockContext {
   const tools: MockContext["tools"] = []
   const hooks: MockContext["hooks"] = {}
+  const activeSessions = new Set<string>()
   const promptCalls: MockContext["promptCalls"] = []
   const disposals: string[] = []
   const stream = controlledStream()
@@ -107,6 +110,7 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
   })
   return {
     options: { min_interval_seconds: 1, busy_backoff_seconds: 1, failure_backoff_seconds: 1, ...options },
+    activeSessions,
     promptCalls,
     tools,
     commandDraft,
@@ -130,6 +134,7 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
         hooks[name] = callback
         return registration(`session.hook:${name}`)
       },
+      active: async () => Object.fromEntries([...activeSessions].map((sessionID) => [sessionID, { type: "running" as const }])),
       prompt: async (input) => {
         promptCalls.push(input)
         return { id: "pending_1" }
@@ -289,6 +294,7 @@ test("V2 busy/idle events defer and then inject loop iterations", async () => {
   const cleanup = await plugin.setup(mock as never)
 
   mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  mock.activeSessions.add("ses_v2")
   const created = JSON.parse(
     contentOf(await loopTool(mock, "create_loop").execute({ instruction: "say tick", interval: "1s" }, toolContext())),
   ) as { created: string }
@@ -297,6 +303,7 @@ test("V2 busy/idle events defer and then inject loop iterations", async () => {
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getLoop(created.created))?.lastResult).toBe("skipped_busy")
 
+  mock.activeSessions.delete("ses_v2")
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
   await waitFor(() => mock.promptCalls.length >= 1)
   expect(mock.promptCalls[0]?.sessionID).toBe("ses_v2")
@@ -306,6 +313,26 @@ test("V2 busy/idle events defer and then inject loop iterations", async () => {
   // Wait until the run is recorded and the next timer is armed so cleanup can
   // cancel it; otherwise the re-armed timer leaks past cleanup.
   await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 authoritative session state overrides a stale busy event", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+
+  mock.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "busy" } } })
+  await sleep(20)
+  const created = JSON.parse(
+    contentOf(await loopTool(mock, "create_loop").execute({ instruction: "say tick", interval: "1s" }, toolContext())),
+  ) as { created: string }
+
+  // The idle event was lost, but OpenCode's active-session API is authoritative
+  // and no longer lists this session as running.
+  await waitFor(() => mock.promptCalls.length >= 1)
+  expect(mock.promptCalls[0]?.sessionID).toBe("ses_v2")
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+
   mock.stream.end()
   await cleanup()
 })
