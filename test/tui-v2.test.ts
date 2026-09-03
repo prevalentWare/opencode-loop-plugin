@@ -111,9 +111,12 @@ function mockContext() {
         current: () => route,
       },
       tabs: undefined,
-      slot(name: string, render: (props: { sessionID: string }) => unknown) {
-        slots.set(name, render)
-        return () => disposed.push(name)
+      slot(claim: {
+        append: string
+        render: (props: { sessionID: string }) => unknown
+      }) {
+        slots.set(claim.append, claim.render)
+        return () => disposed.push(claim.append)
       },
     },
   }

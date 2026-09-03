@@ -771,10 +771,24 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   if (registerCommand) {
     registrations.push(
       await context.command.transform((draft) => {
-        if (draft.get(commandName)) return
-        draft.update(commandName, (command) => {
-          command.description = "Run an instruction on a recurring interval while this session is idle"
-          command.template = loopCommandTemplate(commandName, minIntervalSeconds)
+        draft.add({
+          name: commandName,
+          description: "Run an instruction on a recurring interval while this session is idle",
+          execute: async (input) => {
+            const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
+            await context.session.prompt({
+              ...input.prompt,
+              files: input.prompt.files?.map(stripMention),
+              agents: input.prompt.agents?.map(stripMention),
+              skills: input.prompt.skills?.map(stripMention),
+              sessionID: input.sessionID,
+              text: loopCommandTemplate(commandName, minIntervalSeconds).replaceAll(
+                "$ARGUMENTS",
+                () => input.prompt.text.trim(),
+              ),
+              delivery: input.delivery,
+            })
+          },
         })
       }),
     )
