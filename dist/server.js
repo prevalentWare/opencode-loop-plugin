@@ -1198,8 +1198,12 @@ async function setupV2(context) {
         name: commandName,
         description: "Run an instruction on a recurring interval while this session is idle",
         execute: async (input) => {
+          const stripMention = ({ mention: _mention, ...attachment }) => attachment;
           await context.session.prompt({
             ...input.prompt,
+            files: input.prompt.files?.map(stripMention),
+            agents: input.prompt.agents?.map(stripMention),
+            skills: input.prompt.skills?.map(stripMention),
             sessionID: input.sessionID,
             text: loopCommandTemplate(commandName, minIntervalSeconds).replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
             delivery: input.delivery
