@@ -493,8 +493,11 @@ function LoopKeymapLayerV2(api: TuiPluginV2.Context) {
 }
 
 export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
-  const offSidebar = context.ui.slot("sidebar.content", (props) => LoopSidebarV2(context, props.sessionID))
-  const offApp = context.ui.slot("app", () => LoopKeymapLayerV2(context))
+  const offSidebar = context.ui.slot({
+    append: "sidebar.content",
+    render: (props) => LoopSidebarV2(context, props.sessionID),
+  })
+  const offApp = context.ui.slot({ append: "app", render: () => LoopKeymapLayerV2(context) })
   return () => {
     offSidebar()
     offApp()
