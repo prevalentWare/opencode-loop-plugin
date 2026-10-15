@@ -22,6 +22,7 @@ import {
   ownsSessionLease,
   parseInterval,
   pauseLoop,
+  rescheduleDynamicIfUnchanged,
   resumeLoop,
   scheduleNextRun,
   stopLoop,
@@ -50,6 +51,8 @@ type Options = {
   max_loop_age_days?: number
   dynamic_max_delay_seconds?: number
   restricted_agents?: string[]
+  dynamic_restart_mode?: string
+  dynamic_restart_fallback_seconds?: number
 }
 
 type PendingDynamicTurn = { sessionID: string; sawBusy: boolean }
@@ -64,6 +67,7 @@ const DEFAULT_MAX_FAILURE_BACKOFF_SECONDS = 60 * 60
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
 const DEFAULT_MAX_LOOP_AGE_DAYS = 7
 const DEFAULT_DYNAMIC_MAX_DELAY_SECONDS = 24 * 60 * 60
+const DEFAULT_DYNAMIC_RESTART_FALLBACK_SECONDS = 20 * 60
 const RUN_CLAIM_LEASE_MS = 30_000
 const SESSION_LEASE_MS = 90_000
 const SESSION_LEASE_HEARTBEAT_MS = 30_000
@@ -87,6 +91,20 @@ function nonNegativeNumberOr(value: unknown, fallback: number) {
 function restrictedAgentSet(options?: Options) {
   const names = Array.isArray(options?.restricted_agents) ? options.restricted_agents : DEFAULT_RESTRICTED_AGENTS
   return new Set(names.map((name) => (typeof name === "string" ? name.trim().toLowerCase() : "")).filter(Boolean))
+}
+
+function dynamicRestartMode(options?: Options) {
+  return options?.dynamic_restart_mode?.trim().toLowerCase() === "stop" ? "stop" : "fallback"
+}
+
+function dynamicRestartFallbackMs(options?: Options, minIntervalSeconds?: number, dynamicMaxDelaySeconds?: number) {
+  const fallbackSeconds = positiveNumberOr(
+    options?.dynamic_restart_fallback_seconds,
+    DEFAULT_DYNAMIC_RESTART_FALLBACK_SECONDS,
+  )
+  const minMs = (minIntervalSeconds ?? DEFAULT_MIN_INTERVAL_SECONDS) * 1000
+  const maxMs = (dynamicMaxDelaySeconds ?? DEFAULT_DYNAMIC_MAX_DELAY_SECONDS) * 1000
+  return Math.min(Math.max(Math.round(fallbackSeconds * 1000), minMs), Math.max(maxMs, minMs))
 }
 
 function registerDesktopCommand(config: Config, commandName: string, minIntervalSeconds: number) {
@@ -154,6 +172,8 @@ const server: Plugin = async ({ client, directory }, options?: Options) => {
   const maxLoopAgeMs = nonNegativeNumberOr(options?.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000
   const dynamicMaxDelaySeconds = positiveNumberOr(options?.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS)
   const restrictedAgents = restrictedAgentSet(options)
+  const restartMode = dynamicRestartMode(options)
+  const restartFallbackMs = dynamicRestartFallbackMs(options, minIntervalSeconds, dynamicMaxDelaySeconds)
 
   let disposed = false
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -435,6 +455,16 @@ const server: Plugin = async ({ client, directory }, options?: Options) => {
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID) continue
       staleDynamicCandidates.delete(loopID)
+      if (restartMode === "fallback") {
+        const rescheduled = await rescheduleDynamicIfUnchanged(
+          loopID, candidate.updatedAt, restartFallbackMs, "restarted with fallback delay; reschedule or stop after this iteration", lease,
+        ).catch(() => null)
+        if (rescheduled) {
+          scheduleTimer(rescheduled)
+          await log("info", "Dynamic loop resumed with fallback delay after restart", { loopID })
+          continue
+        }
+      }
       await stopLoopIfUnchanged(
         loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
       )
@@ -729,6 +759,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const maxLoopAgeMs = nonNegativeNumberOr(options.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000
   const dynamicMaxDelaySeconds = positiveNumberOr(options.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS)
   const restrictedAgents = restrictedAgentSet(options)
+  const restartMode = dynamicRestartMode(options)
+  const restartFallbackMs = dynamicRestartFallbackMs(options, minIntervalSeconds, dynamicMaxDelaySeconds)
 
   let disposed = false
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -1041,6 +1073,19 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID) continue
       staleDynamicCandidates.delete(loopID)
+      if (restartMode === "fallback") {
+        const rescheduled = await rescheduleDynamicIfUnchanged(
+          loopID, candidate.updatedAt, restartFallbackMs, "restarted with fallback delay; reschedule or stop after this iteration", lease,
+        ).catch(() => null)
+        if (rescheduled) {
+          scheduleTimer(rescheduled)
+          v2Log("info", "Dynamic loop resumed with fallback delay after restart", {
+            loopID,
+            sessionID,
+          })
+          continue
+        }
+      }
       await stopLoopIfUnchanged(
         loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
       )
@@ -1177,6 +1222,17 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (!reminder) return
       if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER))) return
       sessionContext.system.push({ type: "text", text: reminder })
+    }),
+  )
+
+  registrations.push(
+    await context.session.hook("compaction", async (sessionCompaction) => {
+      await observeSession(sessionCompaction.sessionID)
+      const loops = await openLoops(sessionCompaction.sessionID)
+      const contextText = compactionContext(loops)
+      if (!contextText) return
+      if (sessionCompaction.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER))) return
+      sessionCompaction.system.push({ type: "text", text: contextText })
     }),
   )
 

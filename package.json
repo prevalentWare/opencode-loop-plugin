@@ -29,15 +29,13 @@
   "author": "Prevalentware",
   "type": "module",
   "exports": {
-    "./server": {
-      "import": "./dist/server.js"
-    },
-    "./tui": {
-      "import": "./src/tui.tsx"
-    }
+    "./server": "./server.js",
+    "./tui": "./tui.js"
   },
   "files": [
     "dist",
+    "server.js",
+    "tui.js",
     "src/tui.tsx",
     "LICENSE",
     "README.md"
@@ -46,6 +44,7 @@
     "clean": "rm -rf dist",
     "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external zod",
     "ci:version": "bun scripts/resolve-ci-version.ts",
+    "install:global": "bun scripts/install.mjs --global",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",
     "test": "bun test",

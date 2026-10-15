@@ -92,7 +92,19 @@ For manual installation, add the package to both V2 plugin lists.
 
 OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and palette integration are loaded from the global `~/.config/opencode/cli.json`.
 
-V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The plugin does not yet integrate the V2 compaction hook. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
+Use the bundled installer to update both V2 entries at once:
+
+```sh
+bun scripts/install.mjs --global
+bun scripts/install.mjs --project /path/to/project
+```
+
+File-spec installs (local paths) require the entry files at the package root:
+`./server.js` and `./tui.js` re-export `./dist/server.js` and `./src/tui.tsx`.
+Subpath-only entries are silently skipped by some hosts, so keep the root
+bridges even though the built bundle lives in `dist/`.
+
+V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, TUI sidebar/palette integration, and the `compaction` hook for preserving loops across compaction. Stale dynamic loops resume with a configurable fallback delay after restart (`dynamic_restart_mode: "fallback"`, default 20m) instead of stopping.
 
 ## Usage
 
@@ -172,6 +184,8 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
         "max_consecutive_failures": 5,
         "max_loop_age_days": 7,
         "dynamic_max_delay_seconds": 86400,
+        "dynamic_restart_mode": "fallback",
+        "dynamic_restart_fallback_seconds": 1200,
         "restricted_agents": ["plan"],
         "register_command": true,
         "command_name": "loop"
@@ -197,6 +211,8 @@ In OpenCode 2, use the plugin object form:
         "max_consecutive_failures": 5,
         "max_loop_age_days": 7,
         "dynamic_max_delay_seconds": 86400,
+        "dynamic_restart_mode": "fallback",
+        "dynamic_restart_fallback_seconds": 1200,
         "restricted_agents": ["plan"],
         "register_command": true,
         "command_name": "loop"
@@ -216,6 +232,8 @@ Defaults:
 - `max_consecutive_failures`: `5`; number of consecutive provider/model failures after which the loop is paused with an inspectable `blockedReason`.
 - `max_loop_age_days`: `7`; loops stop automatically after this age. Set `0` to disable expiry.
 - `dynamic_max_delay_seconds`: `86400`; upper clamp for `schedule_next_run` delays.
+- `dynamic_restart_mode`: `"fallback"`; stale dynamic loops resume with a fallback delay after restart instead of stopping. Set `"stop"` for the legacy stop behavior.
+- `dynamic_restart_fallback_seconds`: `1200`; fallback delay for stale dynamic loops, clamped to `[min_interval_seconds, dynamic_max_delay_seconds]`.
 - `restricted_agents`: `["plan"]`; iterations are deferred while the session's last prompt came from one of these agents.
 - `register_command`: `true`
 - `command_name`: `"loop"`

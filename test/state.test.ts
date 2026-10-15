@@ -22,6 +22,7 @@ import {
   recordRunSentClaimed,
   recordRunFailedClaimed,
   recordRunDeferredClaimed,
+  rescheduleDynamicIfUnchanged,
   stopLoopClaimed,
   recordRunFailed,
   recordRunSent,
@@ -170,6 +171,18 @@ test("conditional dynamic cleanup ignores missing and changed loops", async () =
   await scheduleNextRun(scheduled.id, 60_000, "still owned")
   expect(await stopLoopIfUnchanged(scheduled.id, scheduled.updatedAt, "stale after restart")).toBeNull()
   expect((await getLoop(scheduled.id))?.status).toBe("active")
+})
+
+test("stale dynamic loops resume with fallback delay instead of stopping", async () => {
+  const created = await createLoop("ses_1", { prompt: "watch CI", mode: "dynamic" })
+  const resumed = await rescheduleDynamicIfUnchanged(created.id, created.updatedAt, 120_000, "restart fallback")
+  expect(resumed?.nextRunAt).toBeGreaterThan(Date.now())
+  expect(resumed?.status).toBe("active")
+  expect(resumed?.lastReason).toBe("restart fallback")
+
+  const changed = (await getLoop(created.id))!
+  expect(await rescheduleDynamicIfUnchanged(created.id, created.updatedAt, 120_000, "stale")).toBeNull()
+  expect(changed.nextRunAt).not.toBeNull()
 })
 
 test("serializes state mutations across processes", async () => {
