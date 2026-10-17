@@ -626,52 +626,71 @@ const server: Plugin = async ({ client, directory }, options?: Options) => {
             ? output.message.agent
             : undefined
       if (typeof sessionID !== "string") return
-      await observeSession(sessionID)
+      try {
+        await observeSession(sessionID)
+      } catch {
+        // Passive hooks must never break normal dialogue: a transient state
+        // lock failure is retried by the scheduler heartbeat.
+        await log("error", "Loop session observation failed", { sessionID, category: "state" })
+        return
+      }
       if (typeof agent !== "string" || !agent.trim()) return
       lastPromptAgentBySession.set(sessionID, agent.trim())
     },
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
-      await observeSession(input.sessionID)
-      const loops = await openLoops(input.sessionID)
-      const reminder = systemReminder(loops)
-      if (!reminder) return
-      if (output.system.some((block) => block.includes(LOOP_SYSTEM_MARKER))) return
-      if (output.system.length === 0) output.system.push(reminder)
-      else output.system[0] = `${output.system[0]}\n\n${reminder}`
+      try {
+        await observeSession(input.sessionID)
+        const loops = await openLoops(input.sessionID)
+        const reminder = systemReminder(loops)
+        if (!reminder) return
+        if (output.system.some((block) => block.includes(LOOP_SYSTEM_MARKER))) return
+        if (output.system.length === 0) output.system.push(reminder)
+        else output.system[0] = `${output.system[0]}\n\n${reminder}`
+      } catch {
+        await log("error", "Loop system reminder failed", { sessionID: input.sessionID, category: "state" })
+      }
     },
     async "experimental.session.compacting"(input, output) {
-      await observeSession(input.sessionID)
-      const loops = await openLoops(input.sessionID)
-      const context = compactionContext(loops)
-      if (context) output.context.push(context)
+      try {
+        await observeSession(input.sessionID)
+        const loops = await openLoops(input.sessionID)
+        const context = compactionContext(loops)
+        if (context) output.context.push(context)
+      } catch {
+        await log("error", "Loop compaction context failed", { sessionID: input.sessionID, category: "state" })
+      }
     },
     async event({ event }) {
-      const typed = event as { type?: string; properties?: Record<string, unknown> }
-      const sessionID = sessionIDFromEvent(typed)
-      if (!sessionID) return
-      await observeSession(sessionID)
-      if (isBusyEvent(typed)) {
-        busySessions.add(sessionID)
-        for (const pending of dynamicPending.values()) {
-          if (pending.sessionID === sessionID) pending.sawBusy = true
+      try {
+        const typed = event as { type?: string; properties?: Record<string, unknown> }
+        const sessionID = sessionIDFromEvent(typed)
+        if (!sessionID) return
+        await observeSession(sessionID)
+        if (isBusyEvent(typed)) {
+          busySessions.add(sessionID)
+          for (const pending of dynamicPending.values()) {
+            if (pending.sessionID === sessionID) pending.sawBusy = true
+          }
+          return
         }
-        return
-      }
-      if (typed.type === "session.deleted") {
-        busySessions.delete(sessionID)
-        lastPromptAgentBySession.delete(sessionID)
-        const stopped = await stopLoopsForSession(sessionID, "session deleted")
-        for (const loop of stopped) {
-          cancelTimer(loop.id)
-          dynamicPending.delete(loop.id)
+        if (typed.type === "session.deleted") {
+          busySessions.delete(sessionID)
+          lastPromptAgentBySession.delete(sessionID)
+          const stopped = await stopLoopsForSession(sessionID, "session deleted")
+          for (const loop of stopped) {
+            cancelTimer(loop.id)
+            dynamicPending.delete(loop.id)
+          }
+          return
         }
-        return
-      }
-      if (isIdleEvent(typed)) {
-        busySessions.delete(sessionID)
-        await settleDynamicLoops(sessionID)
-        await runDueForSession(sessionID)
+        if (isIdleEvent(typed)) {
+          busySessions.delete(sessionID)
+          await settleDynamicLoops(sessionID)
+          await runDueForSession(sessionID)
+        }
+      } catch {
+        await log("error", "Loop event handling failed", { category: "state" })
       }
     },
   }
@@ -1171,12 +1190,18 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   registrations.push(
     await context.session.hook("context", async (sessionContext) => {
-      await observeSession(sessionContext.sessionID)
-      const loops = await openLoops(sessionContext.sessionID)
-      const reminder = systemReminder(loops)
-      if (!reminder) return
-      if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER))) return
-      sessionContext.system.push({ type: "text", text: reminder })
+      try {
+        await observeSession(sessionContext.sessionID)
+        const loops = await openLoops(sessionContext.sessionID)
+        const reminder = systemReminder(loops)
+        if (!reminder) return
+        if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER))) return
+        sessionContext.system.push({ type: "text", text: reminder })
+      } catch {
+        // Passive hooks must never break normal dialogue; the scheduler
+        // heartbeat retries the observation.
+        v2Log("error", "Loop context hook failed", { sessionID: sessionContext.sessionID, category: "state" })
+      }
     }),
   )
 
@@ -1199,7 +1224,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       while (true) {
         const { done, value } = await iterator.next()
         if (done) break
-        await handleV2Event(value as V2EventLike)
+        try {
+          await handleV2Event(value as V2EventLike)
+        } catch {
+          // One bad event must not kill the consumer: that would silently
+          // disable all future event-driven scheduling until process restart.
+          v2Log("error", "V2 event handling failed", { category: "event" })
+        }
       }
     } catch {
       if (!abortController.signal.aborted) v2Log("error", "V2 event consumer stopped", { category: "event" })

@@ -555,3 +555,24 @@ test("V1 keep-alive recovery refuses a session in another directory", async () =
   expect((await getLoop(loop.id))?.lastResult).toBeNull()
   await hooks.dispose?.()
 })
+
+test("V1 passive hooks survive loop state failures instead of breaking dialogue", async () => {
+  const sent: SentPrompt[] = []
+  const hooks = await makeServer(sent)
+  // A file where the state directory should be makes every state mutation
+  // fail deterministically on any platform.
+  const blocker = join(dir, "blocker")
+  await writeFile(blocker, "not a directory")
+  process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+  const sessionID = "ses_broken_state"
+  await hooks["chat.message"]?.({ sessionID, agent: "build" } as never, { message: { sessionID } } as never)
+  const system = { system: [] as string[] }
+  await hooks["experimental.chat.system.transform"]?.({ sessionID } as never, system as never)
+  expect(system.system).toEqual([])
+  const compacting = { sessionID, context: [] as string[] }
+  await hooks["experimental.session.compacting"]?.(compacting as never, compacting as never)
+  expect(compacting.context).toEqual([])
+  await hooks.event?.({ event: { type: "session.deleted", properties: { sessionID } } } as never)
+  expect(sent).toHaveLength(0)
+  await hooks.dispose?.()
+})

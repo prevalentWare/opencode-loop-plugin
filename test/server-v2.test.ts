@@ -954,3 +954,48 @@ test("V2 bounds native wait even when the stable adapter ignores cancellation", 
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getLoop(loop.id))?.runCount).toBe(0)
 })
+
+test("V2 context hook survives loop state failures", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  // A file where the state directory should be makes every state mutation
+  // fail deterministically on any platform.
+  const blocker = join(dir, "blocker")
+  await writeFile(blocker, "not a directory")
+  process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+
+  const contextHook = mock.hooks["context"]!
+  const sessionContext = {
+    sessionID: "ses_broken_v2",
+    agent: "build",
+    system: [] as Array<{ type: string; text: string }>,
+    messages: [],
+    tools: {},
+  }
+  await contextHook(sessionContext)
+  expect(sessionContext.system).toEqual([])
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 event consumer survives a failing event", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  const blocker = join(dir, "blocker")
+  await writeFile(blocker, "not a directory")
+  process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+
+  mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_bad" } })
+  await waitFor(() => mock.stream.processed >= 1)
+
+  // The consumer must still be alive to process later events once state
+  // recovers; without per-event handling the first failure kills it.
+  process.env.OPENCODE_LOOP_STATE_PATH = join(dir, "loops.json")
+  const processed = mock.stream.processed
+  mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_ok" } })
+  await waitFor(() => mock.stream.processed >= processed + 1)
+
+  mock.stream.end()
+  await cleanup()
+})

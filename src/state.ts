@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
-import { chmod, mkdir, link, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, link, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
 
 export type LoopStatus = "active" | "paused" | "stopped" | "completed"
@@ -222,9 +222,24 @@ async function readRawState() {
 
 const LOCK_WAIT_MS = 30_000
 const LOCK_RETRY_MS = 10
+// Windows reports benign lock handoffs (delete-pending handles, antivirus
+// scans) as EPERM/EBUSY/EACCES/ENOTEMPTY on open/link. Retry those briefly;
+// anything longer is genuine contention (handled via the EEXIST path) or a
+// persistent problem worth surfacing instead of hanging until the lock
+// deadline.
+const TRANSIENT_LOCK_CODES = new Set(["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"])
+const TRANSIENT_LOCK_BUDGET_MS = 5_000
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+export function isTransientLockError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    TRANSIENT_LOCK_CODES.has((error as NodeJS.ErrnoException).code ?? "")
+  )
 }
 
 function processIsAlive(pid: number) {
@@ -239,7 +254,16 @@ function processIsAlive(pid: number) {
 async function acquireProcessLock(lock: string, deadline: number): Promise<() => Promise<void>> {
   const token = `${process.pid}-${randomUUID()}`
   const ownerPath = `${lock}.owner.${token}`
-  await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
+  const startedAt = Date.now()
+  for (;;) {
+    try {
+      await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
+      break
+    } catch (error) {
+      if (!isTransientLockError(error) || Date.now() - startedAt >= TRANSIENT_LOCK_BUDGET_MS) throw error
+      await sleep(LOCK_RETRY_MS)
+    }
+  }
   let acquired = false
   try {
     for (;;) {
@@ -248,14 +272,43 @@ async function acquireProcessLock(lock: string, deadline: number): Promise<() =>
         await link(ownerPath, lock)
         acquired = true
         return async () => {
+          // Best-effort: a release failure must never turn a successful
+          // mutation into a user-visible error. An unreleased lock recovers
+          // via the dead-pid check in the contention path below.
           try {
-            if (await readFile(lock, "utf8").catch(() => null) === token) await rm(lock, { force: true })
+            let current: string | null = null
+            try {
+              current = await readFile(lock, "utf8")
+            } catch (error) {
+              if (!isMissingStateFile(error) && !isTransientLockError(error)) throw error
+            }
+            if (current === token) {
+              const releasedAt = Date.now()
+              for (;;) {
+                try {
+                  await rm(lock, { force: true })
+                  break
+                } catch (error) {
+                  if (!isTransientLockError(error) || Date.now() - releasedAt >= TRANSIENT_LOCK_BUDGET_MS) throw error
+                  await sleep(LOCK_RETRY_MS)
+                }
+              }
+            }
+          } catch {
+            // Ignore: the next contender reclaims a stale lock by pid.
           } finally {
-            await rm(ownerPath, { force: true })
+            await rm(ownerPath, { force: true }).catch(() => undefined)
           }
         }
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          // On Windows, linking onto a path whose deletion is still pending
+          // surfaces as EPERM/EACCES rather than EEXIST. Treat it as a
+          // mid-handoff retry instead of a fatal error.
+          if (!isTransientLockError(error) || Date.now() - startedAt >= TRANSIENT_LOCK_BUDGET_MS) throw error
+          await sleep(LOCK_RETRY_MS)
+          continue
+        }
         try {
           const owner = await readFile(lock, "utf8")
           const pid = Number(owner.split("-", 1)[0])
@@ -272,20 +325,42 @@ async function acquireProcessLock(lock: string, deadline: number): Promise<() =>
             }
           }
         } catch (lockError) {
-          if (!isMissingStateFile(lockError)) throw lockError
+          if (!isMissingStateFile(lockError) && !isTransientLockError(lockError)) throw lockError
         }
         if (Date.now() >= deadline) throw new Error("timed out waiting for the loop state lock", { cause: error })
         await sleep(LOCK_RETRY_MS)
       }
     }
   } finally {
-    if (!acquired) await rm(ownerPath, { force: true })
+    if (!acquired) await rm(ownerPath, { force: true }).catch(() => undefined)
+  }
+}
+
+async function sweepStaleOwnerFiles(lock: string) {
+  // Contenders that crashed between creating their owner file and linking
+  // leave orphans no other path removes. Reclaim only dead pids; a live
+  // contender's file may be mid-link.
+  try {
+    const dir = dirname(lock)
+    const prefix = `${basename(lock)}.owner.`
+    const entries = await readdir(dir)
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix)) continue
+      const rest = entry.slice(prefix.length)
+      if (!/^\d+-[0-9a-f-]{36}$/.test(rest)) continue
+      const pid = Number(rest.split("-", 1)[0])
+      if (pid === process.pid || processIsAlive(pid)) continue
+      await rm(join(dir, entry), { force: true }).catch(() => undefined)
+    }
+  } catch {
+    // Best-effort hygiene; lock acquisition proceeds regardless.
   }
 }
 
 async function acquireMutationLock() {
   const file = statePath()
   await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  await sweepStaleOwnerFiles(`${file}.lock`)
   return acquireProcessLock(`${file}.lock`, Date.now() + LOCK_WAIT_MS)
 }
 

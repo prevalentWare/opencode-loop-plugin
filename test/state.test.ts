@@ -13,6 +13,7 @@ import {
   formatInterval,
   formatLoops,
   getLoop,
+  isTransientLockError,
   listLoops,
   activeLoops,
   parseInterval,
@@ -485,4 +486,18 @@ test("keep-alive loops cannot delegate pacing to the agent", async () => {
   await expect(createLoop("ses_1", { prompt: "tick", mode: "dynamic", keepAlive: true })).rejects.toThrow(
     /keep-alive loops require a fixed interval/,
   )
+})
+
+test("classifies transient file-lock errors for the cross-process lock protocol", () => {
+  // Windows reports benign lock handoffs (delete-pending handles, antivirus
+  // scans) as these codes on open/link. They must be retried, never fatal.
+  for (const code of ["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"]) {
+    expect(isTransientLockError(Object.assign(new Error("denied"), { code }))).toBe(true)
+  }
+  for (const code of ["ENOENT", "EEXIST", "EISDIR", "EINVAL"]) {
+    expect(isTransientLockError(Object.assign(new Error("other"), { code }))).toBe(false)
+  }
+  expect(isTransientLockError(new Error("plain"))).toBe(false)
+  expect(isTransientLockError(null)).toBe(false)
+  expect(isTransientLockError("EPERM")).toBe(false)
 })
