@@ -194,10 +194,44 @@ test("dynamic loops continue while schedule_next_run keeps being called", async 
 
   await busy(hooks, "ses_1")
   await idle(hooks, "ses_1")
+  await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
   const settled = await getLoop(created.created)
   expect(settled?.status).toBe("stopped")
   expect(settled?.stopReason).toContain("without scheduling")
   await hooks.dispose?.()
+})
+
+test("V1 a terminal event during accepted delivery settles after accounting commits", async () => {
+  const sent: SentPrompt[] = []
+  const client = fakeClient(sent)
+  const delivery = client.session.promptAsync
+  let acceptDelivery = () => {}
+  const accepted = new Promise<void>((resolve) => { acceptDelivery = resolve })
+  client.session.promptAsync = async (input) => {
+    await delivery(input)
+    await accepted
+  }
+  const hooks = await serverModule.server({ client } as never, { min_interval_seconds: 1 } as never)
+  try {
+    const created = JSON.parse(await tool(hooks, "create_loop").execute(
+      { instruction: "watch CI" }, { sessionID: "ses_delivery" },
+    )) as { created: string }
+    await tool(hooks, "schedule_next_run").execute(
+      { loop_id: created.created, delay_seconds: 1, reason: "test" }, { sessionID: "ses_delivery" },
+    )
+    await waitFor(() => sent.length === 1)
+    await busy(hooks, "ses_delivery")
+    await idle(hooks, "ses_delivery")
+    expect((await getLoop(created.created))?.status).toBe("active")
+    expect((await getLoop(created.created))?.runCount).toBe(0)
+    acceptDelivery()
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+    expect((await getLoop(created.created))?.runCount).toBe(1)
+    expect((await getLoop(created.created))?.stopReason).toContain("without scheduling")
+  } finally {
+    acceptDelivery()
+    await hooks.dispose?.()
+  }
 })
 
 test("schedule_next_run rejects fixed-interval loops", async () => {
