@@ -1006,3 +1006,169 @@ test("V2 bounds native wait even when the stable adapter ignores cancellation", 
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getLoop(loop.id))?.runCount).toBe(0)
 })
+
+test("V2 context hook survives loop state failures", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  // A file where the state directory should be makes every state mutation
+  // fail deterministically on any platform.
+  const blocker = join(dir, "blocker")
+  await writeFile(blocker, "not a directory")
+  process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+
+  const contextHook = mock.hooks["context"]!
+  const sessionContext = {
+    sessionID: "ses_broken_v2",
+    agent: "build",
+    system: [] as Array<{ type: string; text: string }>,
+    messages: [],
+    tools: {},
+  }
+  await contextHook(sessionContext)
+  expect(sessionContext.system).toEqual([])
+  await mock.hooks.compaction?.(sessionContext)
+  expect(sessionContext.system).toEqual([])
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 event consumer survives a failing event", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  const blocker = join(dir, "blocker")
+  await writeFile(blocker, "not a directory")
+  process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+
+  mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_bad" } })
+  await waitFor(() => mock.stream.processed >= 1)
+
+  // The consumer must still be alive to process later events once state
+  // recovers; without per-event handling the first failure kills it.
+  process.env.OPENCODE_LOOP_STATE_PATH = join(dir, "loops.json")
+  const loop = await createLoop("ses_ok", { prompt: "tick", intervalMs: 1 })
+  const processed = mock.stream.processed
+  mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_ok" } })
+  await waitFor(() => mock.stream.processed >= processed + 1)
+  await waitFor(async () => (await getLoop(loop.id))?.runCount === 1)
+  expect(mock.promptCalls.some((prompt) => prompt.sessionID === "ses_ok")).toBe(true)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 retains Plan selection when its event cannot observe state", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  const originalPath = process.env.OPENCODE_LOOP_STATE_PATH
+  try {
+    const result = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "tick", interval: "1s" }, toolContext("ses_plan_failure"),
+    ))) as { created: string }
+    const blocker = join(dir, "plan-blocker")
+    await writeFile(blocker, "not a directory")
+    process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+    const processed = mock.stream.processed
+    mock.stream.push({ type: "session.agent.selected", created: Date.now(), data: { sessionID: "ses_plan_failure", agent: "plan" } })
+    await waitFor(() => mock.stream.processed > processed)
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await waitFor(async () => (await getLoop(result.created))?.lastResult === "skipped_plan")
+    expect(mock.promptCalls).toHaveLength(0)
+  } finally {
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test.each(["session.execution.succeeded", "session.deleted"])("V2 retries the persisted transition after %s fails", async (eventType) => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  const originalPath = process.env.OPENCODE_LOOP_STATE_PATH
+  try {
+    const result = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "tick" }, toolContext("ses_retry_event"),
+    ))) as { created: string }
+    const blocker = join(dir, "event-blocker")
+    await writeFile(blocker, "not a directory")
+    process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+    const processed = mock.stream.processed
+    mock.stream.push({ type: eventType, created: Date.now(), data: { sessionID: "ses_retry_event" } })
+    await waitFor(() => mock.stream.processed > processed)
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await mock.hooks.context?.({ sessionID: "ses_retry_event", system: [] })
+    expect((await getLoop(result.created))?.status).toBe("stopped")
+    expect(mock.promptCalls).toHaveLength(0)
+  } finally {
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 shutdown preserves unscheduled dynamic loops for restart fallback", async () => {
+  const first = makeMockContext()
+  const cleanupFirst = await plugin.setup(first as never)
+  const created = JSON.parse(contentOf(await loopTool(first, "create_loop").execute(
+    { instruction: "tick" }, toolContext(),
+  ))) as { created: string }
+  first.stream.push({ type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "ses_v2", reason: "shutdown" } })
+  await waitFor(() => first.stream.processed >= 1)
+  first.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "idle" } } })
+  first.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+  await waitFor(() => first.stream.processed >= 3)
+  expect((await getLoop(created.created))?.status).toBe("active")
+  expect((await getLoop(created.created))?.nextRunAt).toBeNull()
+  first.stream.end()
+  await cleanupFirst()
+  const second = makeMockContext({ dynamic_restart_fallback_seconds: 120 })
+  const cleanupSecond = await plugin.setup(second as never)
+  try {
+    await second.hooks.context?.({ sessionID: "ses_v2", system: [] })
+    expect((await getLoop(created.created))?.nextRunAt).toBeGreaterThan(Date.now())
+  } finally {
+    second.stream.end()
+    await cleanupSecond()
+  }
+})
+
+test("V2 recovers an expired local lease before delivering and settling a dynamic turn", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  const originalNow = Date.now
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute({ instruction: "tick" }, toolContext()))) as { created: string }
+    await loopTool(mock, "schedule_next_run").execute({ loop_id: created.created, delay_seconds: 1, reason: "test" }, toolContext())
+    const future = Date.now() + 91_000
+    Date.now = () => future
+    await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+    mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+  } finally {
+    Date.now = originalNow
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 cached recovery arms an ordinary sibling after its session is observed", async () => {
+  const first = makeMockContext()
+  const cleanupFirst = await plugin.setup(first as never)
+  await loopTool(first, "create_loop").execute({ instruction: "keep alive", interval: "1m", keep_alive: true }, toolContext())
+  const ordinary = JSON.parse(contentOf(await loopTool(first, "create_loop").execute(
+    { instruction: "ordinary", interval: "1s" }, toolContext(),
+  ))) as { created: string }
+  first.stream.end()
+  await cleanupFirst()
+  const second = makeMockContext()
+  const cleanupSecond = await plugin.setup(second as never)
+  try {
+    expect(second.promptCalls).toHaveLength(0)
+    await second.hooks.context?.({ sessionID: "ses_v2", system: [] })
+    await waitFor(async () => (await getLoop(ordinary.created))?.runCount === 1)
+  } finally {
+    second.stream.end()
+    await cleanupSecond()
+  }
+})

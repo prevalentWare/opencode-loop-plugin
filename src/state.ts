@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
-import { chmod, mkdir, link, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, link, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
 
 export type LoopStatus = "active" | "paused" | "stopped" | "completed"
@@ -222,9 +222,26 @@ async function readRawState() {
 
 const LOCK_WAIT_MS = 30_000
 const LOCK_RETRY_MS = 10
+// Windows reports benign lock handoffs (delete-pending handles, antivirus
+// scans) as EPERM/EBUSY/EACCES/ENOTEMPTY on open/link. Retry those briefly;
+// anything longer is genuine contention (handled via the EEXIST path) or a
+// persistent problem worth surfacing instead of hanging until the lock
+// deadline.
+const TRANSIENT_LOCK_CODES = new Set(["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"])
+const TRANSIENT_LOCK_BUDGET_MS = 5_000
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+export function isTransientLockError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    TRANSIENT_LOCK_CODES.has(error.code)
+  )
 }
 
 function processIsAlive(pid: number) {
@@ -236,37 +253,86 @@ function processIsAlive(pid: number) {
   }
 }
 
+const pendingLockReleases = new Map<string, () => Promise<void>>()
+
+async function retryLockOperation<T>(operation: () => Promise<T>, acquisitionDeadline = Infinity) {
+  const deadline = Math.min(acquisitionDeadline, Date.now() + TRANSIENT_LOCK_BUDGET_MS)
+  for (;;) {
+    try {
+      return await operation()
+    } catch (error) {
+      if (!isTransientLockError(error) || Date.now() >= deadline) throw error
+      await sleep(LOCK_RETRY_MS)
+    }
+  }
+}
+
+function processLockRelease(lock: string, ownerPath: string, token: string) {
+  let running: Promise<void> | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const finish = () => {
+    running ??= (async () => {
+      await retryLockOperation(async () => {
+        const current = await readFile(lock, "utf8").catch((error: unknown) => {
+          if (isMissingStateFile(error)) return null
+          throw error
+        })
+        if (current === token) await rm(lock, { force: true })
+      })
+      if (pendingLockReleases.get(lock) === finish) pendingLockReleases.delete(lock)
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      await rm(ownerPath, { force: true }).catch(() => undefined)
+    })().finally(() => { running = undefined })
+    return running
+  }
+  const release = async () => {
+    try {
+      await finish()
+    } catch {
+      // Keep the exact token available for recovery even while this pid lives.
+      pendingLockReleases.set(lock, finish)
+      if (!timer) {
+        timer = setTimeout(() => { timer = undefined; void release() }, 1000)
+        timer.unref?.()
+      }
+    }
+  }
+  return release
+}
+
 async function acquireProcessLock(lock: string, deadline: number): Promise<() => Promise<void>> {
+  await pendingLockReleases.get(lock)?.()
   const token = `${process.pid}-${randomUUID()}`
   const ownerPath = `${lock}.owner.${token}`
-  await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
   let acquired = false
   try {
+    await retryLockOperation(async () => {
+      // A failed create may leave a partial file at this attempt's unique path.
+      await rm(ownerPath, { force: true })
+      await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
+    }, deadline)
     for (;;) {
+      if (Date.now() >= deadline) throw new Error("timed out waiting for the loop state lock")
       try {
         // Publish the complete identity atomically without requiring symlink privileges.
-        await link(ownerPath, lock)
+        await retryLockOperation(() => link(ownerPath, lock), deadline)
         acquired = true
-        return async () => {
-          try {
-            if (await readFile(lock, "utf8").catch(() => null) === token) await rm(lock, { force: true })
-          } finally {
-            await rm(ownerPath, { force: true })
-          }
-        }
+        return processLockRelease(lock, ownerPath, token)
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+        if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error
         try {
-          const owner = await readFile(lock, "utf8")
+          const owner = await retryLockOperation(() => readFile(lock, "utf8"), deadline)
           const pid = Number(owner.split("-", 1)[0])
           if (/^\d+-[0-9a-f-]{36}$/.test(owner) && !processIsAlive(pid)) {
-            // Recover the guard by the same protocol if a previous reclaimer died.
             const release = await acquireProcessLock(`${lock}.reclaim.${owner}`, deadline)
             try {
-              if (await readFile(lock, "utf8").catch(() => null) === owner) {
-                await rm(lock, { force: true })
-                await rm(`${lock}.owner.${owner}`, { force: true })
-              }
+              await retryLockOperation(async () => {
+                if (await readFile(lock, "utf8") === owner) {
+                  await rm(lock, { force: true })
+                  await rm(`${lock}.owner.${owner}`, { force: true })
+                }
+              }, deadline)
             } finally {
               await release()
             }
@@ -279,13 +345,35 @@ async function acquireProcessLock(lock: string, deadline: number): Promise<() =>
       }
     }
   } finally {
-    if (!acquired) await rm(ownerPath, { force: true })
+    if (!acquired) await rm(ownerPath, { force: true }).catch(() => undefined)
+  }
+}
+
+async function sweepStaleOwnerFiles(lock: string) {
+  // Contenders that crashed between creating their owner file and linking
+  // leave orphans no other path removes. Reclaim only dead pids; a live
+  // contender's file may be mid-link.
+  try {
+    const dir = dirname(lock)
+    const prefix = `${basename(lock)}.owner.`
+    const entries = await readdir(dir)
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix)) continue
+      const rest = entry.slice(prefix.length)
+      if (!/^\d+-[0-9a-f-]{36}$/.test(rest)) continue
+      const pid = Number(rest.split("-", 1)[0])
+      if (pid === process.pid || processIsAlive(pid)) continue
+      await rm(join(dir, entry), { force: true }).catch(() => undefined)
+    }
+  } catch {
+    // Best-effort hygiene; lock acquisition proceeds regardless.
   }
 }
 
 async function acquireMutationLock() {
   const file = statePath()
   await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  await sweepStaleOwnerFiles(`${file}.lock`)
   return acquireProcessLock(`${file}.lock`, Date.now() + LOCK_WAIT_MS)
 }
 
@@ -480,12 +568,16 @@ export async function acquireSessionLease(sessionID: string, instanceID: string,
 }
 
 /** Renews only the exact lease revision previously returned to this instance. */
-export async function renewSessionLease(sessionID: string, instanceID: string, revision: number, leaseMs: number) {
+export async function renewSessionLease(sessionID: string, instanceID: string, revision: number, leaseMs: number, recoverExpired = false) {
   const duration = validLeaseMs(leaseMs)
   return mutate((state) => {
     const timestamp = now()
     const current = state.sessionLeases[sessionID]
-    if (!current || current.instanceID !== instanceID || current.revision !== revision || current.expiresAt <= timestamp) return null
+    if (!current || current.instanceID !== instanceID || current.revision !== revision) return null
+    if (current.expiresAt <= timestamp) {
+      if (!recoverExpired) return null
+      current.revision += 1
+    }
     current.expiresAt = timestamp + duration
     return { ...current }
   })
@@ -646,12 +738,14 @@ export async function stopLoopIfUnchanged(
   expectedUpdatedAt: number,
   reason: string,
   sessionLease?: SessionLease,
+  expectedScheduleRevision?: number,
 ) {
   return mutate((state) => {
     const loop = state.loops[loopID]
     if (!loop || (sessionLease && (sessionLease.sessionID !== loop.sessionID || !matchesSessionLease(state, sessionLease)))) return null
     if (
       loop.updatedAt !== expectedUpdatedAt ||
+      (expectedScheduleRevision !== undefined && loop.scheduleRevision !== expectedScheduleRevision) ||
       loop.status !== "active" ||
       loop.mode !== "dynamic" ||
       loop.nextRunAt != null

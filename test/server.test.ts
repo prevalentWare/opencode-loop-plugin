@@ -575,3 +575,83 @@ test("V1 keep-alive recovery refuses a session in another directory", async () =
   expect((await getLoop(loop.id))?.lastResult).toBeNull()
   await hooks.dispose?.()
 })
+
+test("V1 passive hooks survive loop state failures instead of breaking dialogue", async () => {
+  const sent: SentPrompt[] = []
+  const hooks = await makeServer(sent)
+  // A file where the state directory should be makes every state mutation
+  // fail deterministically on any platform.
+  const blocker = join(dir, "blocker")
+  await writeFile(blocker, "not a directory")
+  process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+  const sessionID = "ses_broken_state"
+  await hooks["chat.message"]?.({ sessionID, agent: "build" } as never, { message: { sessionID } } as never)
+  const system = { system: [] as string[] }
+  await hooks["experimental.chat.system.transform"]?.({ sessionID } as never, system as never)
+  expect(system.system).toEqual([])
+  const compacting = { sessionID, context: [] as string[] }
+  await hooks["experimental.session.compacting"]?.(compacting as never, compacting as never)
+  expect(compacting.context).toEqual([])
+  await hooks.event?.({ event: { type: "session.deleted", properties: { sessionID } } } as never)
+  expect(sent).toHaveLength(0)
+  await hooks.dispose?.()
+})
+
+test("V1 retains Plan safety when passive observation fails", async () => {
+  const sent: SentPrompt[] = []
+  const hooks = await makeServer(sent)
+  const originalPath = process.env.OPENCODE_LOOP_STATE_PATH
+  try {
+    const created = JSON.parse(await tool(hooks, "create_loop").execute(
+      { instruction: "tick", interval: "1s" }, { sessionID: "ses_plan_failure", agent: "build" },
+    )) as { created: string }
+    const blocker = join(dir, "plan-blocker")
+    await writeFile(blocker, "not a directory")
+    process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+    await hooks["chat.message"]?.({ sessionID: "ses_plan_failure", agent: "plan" } as never, { message: {} } as never)
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await waitFor(async () => (await getLoop(created.created))?.lastResult === "skipped_plan")
+    expect(sent).toHaveLength(0)
+  } finally {
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await hooks.dispose?.()
+  }
+})
+
+test.each(["session.idle", "session.deleted"])("V1 retries the persisted transition after %s fails", async (eventType) => {
+  const hooks = await makeServer([])
+  const originalPath = process.env.OPENCODE_LOOP_STATE_PATH
+  try {
+    const result = JSON.parse(await tool(hooks, "create_loop").execute(
+      { instruction: "tick" }, { sessionID: "ses_retry_event" },
+    )) as { created: string }
+    const blocker = join(dir, "event-blocker")
+    await writeFile(blocker, "not a directory")
+    process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+    await hooks.event?.({ event: { type: eventType, properties: { sessionID: "ses_retry_event" } } } as never)
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await hooks["chat.message"]?.({ sessionID: "ses_retry_event", agent: "build" } as never, { message: {} } as never)
+    expect((await getLoop(result.created))?.status).toBe("stopped")
+  } finally {
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await hooks.dispose?.()
+  }
+})
+
+test("V1 cached recovery arms an ordinary sibling after its session is observed", async () => {
+  const first = await makeServer([])
+  await tool(first, "create_loop").execute({ instruction: "keep alive", interval: "1m", keep_alive: true }, { sessionID: "ses_rearm" })
+  const ordinary = JSON.parse(await tool(first, "create_loop").execute(
+    { instruction: "ordinary", interval: "1s" }, { sessionID: "ses_rearm" },
+  )) as { created: string }
+  await first.dispose?.()
+  const sent: SentPrompt[] = []
+  const second = await makeServer(sent)
+  try {
+    expect(sent).toHaveLength(0)
+    await second["chat.message"]?.({ sessionID: "ses_rearm", agent: "build" } as never, { message: {} } as never)
+    await waitFor(async () => (await getLoop(ordinary.created))?.runCount === 1)
+  } finally {
+    await second.dispose?.()
+  }
+})

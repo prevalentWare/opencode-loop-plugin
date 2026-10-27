@@ -13,6 +13,7 @@ import {
   formatInterval,
   formatLoops,
   getLoop,
+  isTransientLockError,
   listLoops,
   activeLoops,
   parseInterval,
@@ -506,4 +507,52 @@ test("keep-alive loops cannot delegate pacing to the agent", async () => {
   await expect(createLoop("ses_1", { prompt: "tick", mode: "dynamic", keepAlive: true })).rejects.toThrow(
     /keep-alive loops require a fixed interval/,
   )
+})
+
+test("classifies transient file-lock errors for the cross-process lock protocol", () => {
+  // Windows reports benign lock handoffs (delete-pending handles, antivirus
+  // scans) as these codes on open/link. They must be retried, never fatal.
+  for (const code of ["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"]) {
+    expect(isTransientLockError(Object.assign(new Error("denied"), { code }))).toBe(true)
+  }
+  for (const code of ["ENOENT", "EEXIST", "EISDIR", "EINVAL"]) {
+    expect(isTransientLockError(Object.assign(new Error("other"), { code }))).toBe(false)
+  }
+  expect(isTransientLockError(new Error("plain"))).toBe(false)
+  expect(isTransientLockError(null)).toBe(false)
+  expect(isTransientLockError("EPERM")).toBe(false)
+})
+
+test("lease recovery preserves exclusive ownership while fencing expired claims", async () => {
+  const originalNow = Date.now
+  let clock = originalNow()
+  Date.now = () => clock
+  try {
+    const lease = (await acquireSessionLease("ses_recover", "owner", 1000))!
+    clock += 1001
+    expect(await renewSessionLease("ses_recover", "owner", lease.revision, 1000)).toBeNull()
+    const recovered = await renewSessionLease("ses_recover", "owner", lease.revision, 1000, true)
+    expect(recovered?.revision).toBe(lease.revision + 1)
+    expect(await ownsSessionLease("ses_recover", "owner", lease.revision)).toBe(false)
+    clock += 1001
+    await acquireSessionLease("ses_recover", "foreign", 1000)
+    expect(await renewSessionLease("ses_recover", "owner", recovered!.revision, 1000, true)).toBeNull()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test("a same-timestamp schedule revision fences an older dynamic settlement", async () => {
+  const originalNow = Date.now
+  const clock = originalNow()
+  Date.now = () => clock
+  try {
+    const loop = await createLoop("ses_revision", { prompt: "tick", mode: "dynamic" })
+    await scheduleNextRun(loop.id, 1)
+    await recordRunSent(loop.id)
+    expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "old turn", undefined, loop.scheduleRevision)).toBeNull()
+    expect((await getLoop(loop.id))?.status).toBe("active")
+  } finally {
+    Date.now = originalNow
+  }
 })
